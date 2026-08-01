@@ -2,12 +2,12 @@ import {
   normalizePlaywrightProxy,
   LOCAL_PROXY_BYPASS_HOSTS,
   createProxyPool,
-  buildDecodoBackconnectUsername,
   buildProxyUrl,
-  decodoProvider,
+  thordataProvider,
   genericBackconnectProvider,
   getProvider,
   registerProvider,
+  shouldProbeGoogleAtLaunch,
 } from '../../lib/proxy.js';
 
 describe('normalizePlaywrightProxy', () => {
@@ -65,29 +65,35 @@ describe('normalizePlaywrightProxy', () => {
   });
 });
 
-describe('decodoProvider', () => {
+describe('thordataProvider', () => {
   test('builds sticky residential username with targeting', () => {
-    expect(decodoProvider.buildSessionUsername('sp6incny2a', {
+    expect(thordataProvider.buildSessionUsername('account123', {
       country: 'us',
-      state: 'us_california',
+      state: 'california',
+      city: 'los angeles',
       sessionId: 'browser-abc123',
       sessionDurationMinutes: 10,
-    })).toBe('user-sp6incny2a-country-us-state-us_california-session-browser_abc123-sessionduration-10');
+    })).toBe('td-customer-account123-country-us-state-california-city-losangeles-sessid-browserabc123-sesstime-10');
   });
 
-  test('sanitizes spaces and punctuation', () => {
-    expect(decodoProvider.buildSessionUsername('User Name', {
+  test('accepts a dashboard username with or without the provider prefix', () => {
+    const options = {
       country: 'US',
       city: 'New York',
       sessionId: 'ctx:1',
-    })).toBe('user-user_name-country-us-city-new_york-session-ctx_1');
+    };
+    expect(thordataProvider.buildSessionUsername('User Name', options))
+      .toBe('td-customer-username-country-us-city-newyork-sessid-ctx1');
+    expect(thordataProvider.buildSessionUsername('td-customer-User Name', options))
+      .toBe('td-customer-username-country-us-city-newyork-sessid-ctx1');
   });
 
   test('declares capabilities', () => {
-    expect(decodoProvider.canRotateSessions).toBe(true);
-    expect(decodoProvider.launchRetries).toBe(10);
-    expect(decodoProvider.launchTimeoutMs).toBe(180000);
-    expect(decodoProvider.name).toBe('decodo');
+    expect(thordataProvider.canRotateSessions).toBe(true);
+    expect(thordataProvider.launchRetries).toBe(1);
+    expect(thordataProvider.probeGoogleAtLaunch).toBe(false);
+    expect(thordataProvider.launchTimeoutMs).toBe(180000);
+    expect(thordataProvider.name).toBe('thordata');
   });
 });
 
@@ -110,19 +116,15 @@ describe('genericBackconnectProvider', () => {
   });
 });
 
-describe('buildDecodoBackconnectUsername (legacy alias)', () => {
-  test('delegates to decodoProvider', () => {
-    expect(buildDecodoBackconnectUsername('sp6incny2a', {
-      country: 'us',
-      sessionId: 'test-1',
-    })).toBe('user-sp6incny2a-country-us-session-test_1');
-  });
-});
-
 describe('getProvider / registerProvider', () => {
   test('returns built-in providers', () => {
-    expect(getProvider('decodo')).toBe(decodoProvider);
+    expect(getProvider('thordata')).toBe(thordataProvider);
     expect(getProvider('generic')).toBe(genericBackconnectProvider);
+  });
+
+  test('retired providers are not selectable', () => {
+    expect(getProvider('dataimpulse')).toBeNull();
+    expect(getProvider('decodo')).toBeNull();
   });
 
   test('returns null for unknown provider', () => {
@@ -140,6 +142,22 @@ describe('getProvider / registerProvider', () => {
     };
     registerProvider('brightdata', custom);
     expect(getProvider('brightdata')).toBe(custom);
+  });
+});
+
+describe('shouldProbeGoogleAtLaunch', () => {
+  test('skips the launch-wide Google probe for Thordata', () => {
+    expect(shouldProbeGoogleAtLaunch({
+      canRotateSessions: true,
+      probeGoogleAtLaunch: false,
+    })).toBe(false);
+  });
+
+  test('keeps the launch probe for rotating providers that opt in', () => {
+    expect(shouldProbeGoogleAtLaunch({
+      canRotateSessions: true,
+      probeGoogleAtLaunch: true,
+    })).toBe(true);
   });
 });
 
@@ -173,31 +191,32 @@ describe('createProxyPool', () => {
     expect(pool.getNext().server).toBe('http://proxy.example.com:10001');
   });
 
-  test('backconnect pool with decodo provider (default)', () => {
+  test('backconnect pool with thordata provider (default)', () => {
     const pool = createProxyPool({
       strategy: 'backconnect',
-      backconnectHost: 'gate.proxy.com',
-      backconnectPort: 7000,
-      username: 'sp6incny2a',
+      backconnectHost: 't.pr.thordata.net',
+      backconnectPort: 9999,
+      username: 'account123',
       password: 'p',
       country: 'us',
-      state: 'us_california',
+      state: 'california',
       sessionDurationMinutes: 10,
     });
 
     expect(pool.mode).toBe('backconnect');
     expect(pool.canRotateSessions).toBe(true);
-    expect(pool.launchRetries).toBe(10);
+    expect(pool.launchRetries).toBe(1);
+    expect(pool.probeGoogleAtLaunch).toBe(false);
     expect(pool.launchTimeoutMs).toBe(180000);
-    expect(pool.provider).toBe(decodoProvider);
+    expect(pool.provider).toBe(thordataProvider);
 
     const launch = pool.getLaunchProxy('browser-1');
-    expect(launch.server).toBe('http://gate.proxy.com:7000');
-    expect(launch.username).toBe('user-sp6incny2a-country-us-state-us_california-session-browser_1-sessionduration-10');
+    expect(launch.server).toBe('http://t.pr.thordata.net:9999');
+    expect(launch.username).toBe('td-customer-account123-country-us-state-california-sessid-browser1-sesstime-10');
     expect(launch.password).toBe('p');
 
     const next = pool.getNext('ctx-1');
-    expect(next.username).toBe('user-sp6incny2a-country-us-state-us_california-session-ctx_1-sessionduration-10');
+    expect(next.username).toBe('td-customer-account123-country-us-state-california-sessid-ctx1-sesstime-10');
   });
 
   test('backconnect pool with explicit generic provider', () => {
@@ -220,6 +239,17 @@ describe('createProxyPool', () => {
     expect(launch.username).toBe('brd-customer-123-browser-1');
   });
 
+  test('rejects a configured retired or unknown provider instead of falling back', () => {
+    expect(() => createProxyPool({
+      strategy: 'backconnect',
+      backconnectHost: 'proxy.example.com',
+      backconnectPort: 9999,
+      username: 'account',
+      password: 'credential',
+      providerName: 'decodo',
+    })).toThrow('Unknown proxy provider "decodo"');
+  });
+
   test('round_robin pool has null provider and no session rotation', () => {
     const pool = createProxyPool({ strategy: 'round_robin', host: 'proxy.example.com', ports: [8080], username: 'u', password: 'p' });
     expect(pool.provider).toBeNull();
@@ -235,15 +265,15 @@ describe('buildProxyUrl', () => {
   test('builds backconnect proxy URL via provider', () => {
     const config = {
       strategy: 'backconnect',
-      username: 'sp6incny2a',
+      username: 'account123',
       password: 'u4q4iklLj3Jof0=IuT',
-      backconnectHost: 'gate.proxy.com',
-      backconnectPort: 7000,
+      backconnectHost: 't.pr.thordata.net',
+      backconnectPort: 9999,
       country: 'us',
     };
     const pool = createProxyPool(config);
     const url = buildProxyUrl(pool, config);
-    expect(url).toMatch(/^http:\/\/user-sp6incny2a.*@gate\.proxy\.com:7000$/);
+    expect(url).toMatch(/^http:\/\/td-customer-account123.*@t\.pr\.thordata\.net:9999$/);
     expect(url).toContain(encodeURIComponent('u4q4iklLj3Jof0=IuT'));
   });
 

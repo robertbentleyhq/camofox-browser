@@ -349,14 +349,17 @@ npm start
 
 **Backconnect proxy (rotating sticky sessions):**
 
-For providers like Decodo, Bright Data, or Oxylabs that offer a single gateway endpoint with session-based sticky IPs:
+For providers like Thordata, Bright Data, or Oxylabs that offer a single gateway endpoint with session-based sticky IPs:
 
 ```bash
 export PROXY_STRATEGY=backconnect
-export PROXY_BACKCONNECT_HOST=gate.provider.com
-export PROXY_BACKCONNECT_PORT=7000
-export PROXY_USERNAME=myuser
+export PROXY_PROVIDER=thordata
+export PROXY_BACKCONNECT_HOST=t.pr.thordata.net
+export PROXY_BACKCONNECT_PORT=9999
+export PROXY_USERNAME=accountuser
 export PROXY_PASSWORD=mypass
+export PROXY_COUNTRY=us
+export PROXY_SESSION_DURATION_MINUTES=10
 npm start
 ```
 
@@ -630,13 +633,13 @@ Reddit macros return JSON directly (no HTML parsing needed):
 | `MAX_CONCURRENT_PER_USER` | Concurrent request cap per user | `3` |
 | `MAX_OLD_SPACE_SIZE` | Node.js V8 heap limit (MB) | `128` |
 | `PROXY_STRATEGY` | Proxy mode: `backconnect` (rotating sticky sessions) or blank (single endpoint) | - |
-| `PROXY_PROVIDER` | Provider name for session format (e.g. `decodo`) | `decodo` |
+| `PROXY_PROVIDER` | Provider name for session format (`thordata` or `generic`) | `thordata` |
 | `PROXY_HOST` | Proxy hostname or IP (simple mode) | - |
 | `PROXY_PORT` | Proxy port (simple mode) | - |
 | `PROXY_USERNAME` | Proxy auth username | - |
 | `PROXY_PASSWORD` | Proxy auth password | - |
 | `PROXY_BACKCONNECT_HOST` | Backconnect gateway hostname | - |
-| `PROXY_BACKCONNECT_PORT` | Backconnect gateway port | `7000` |
+| `PROXY_BACKCONNECT_PORT` | Backconnect gateway port | `9999` |
 | `PROXY_COUNTRY` | Target country for proxy geo-targeting | - |
 | `PROXY_STATE` | Target state/region for proxy geo-targeting | - |
 | `TAB_INACTIVITY_MS` | Close tabs idle longer than this | `300000` (5min) |

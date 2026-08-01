@@ -7,7 +7,7 @@ import fs from 'fs';
 import os from 'os';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
-import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
+import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl, shouldProbeGoogleAtLaunch } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
 import { createPluginEvents, loadPlugins } from './lib/plugins.js';
 import { requireAuth, accessKeyMiddleware, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
@@ -1099,7 +1099,7 @@ async function launchBrowserInstance() {
 
       candidateBrowser = await firefox.launch(options);
 
-      if (proxyPool?.canRotateSessions) {
+      if (shouldProbeGoogleAtLaunch(proxyPool)) {
         const probe = await probeGoogleSearch(candidateBrowser);
         if (!probe.ok) {
           log('warn', 'browser launch google probe failed', {

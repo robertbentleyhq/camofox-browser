@@ -60,7 +60,7 @@ describe('Per-context proxy assignment (backconnect)', () => {
 
   test('backconnect proxy includes session in username', () => {
     const proxy = assignContextProxy(backconnectPool, '42');
-    expect(proxy.username).toContain('session-ctx_42_test');
+    expect(proxy.username).toContain('sessid-ctx42test');
   });
 
   test('round_robin proxy has no sessionId', () => {

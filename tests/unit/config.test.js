@@ -54,6 +54,26 @@ describe('loadConfig', () => {
     expect(config.serverEnv.CAMOFOX_DISABLE_DEFAULT_ADDONS).toBe('true');
   });
 
+  test('defaults the residential proxy to the Thordata gateway port', () => {
+    delete process.env.PROXY_PROVIDER;
+    delete process.env.PROXY_BACKCONNECT_PORT;
+
+    const config = loadConfig();
+
+    expect(config.proxy.providerName).toBe('thordata');
+    expect(config.proxy.backconnectPort).toBe(9999);
+  });
+
+  test('preserves an explicitly configured supported proxy provider and port', () => {
+    process.env.PROXY_PROVIDER = 'generic';
+    process.env.PROXY_BACKCONNECT_PORT = '8080';
+
+    const config = loadConfig();
+
+    expect(config.proxy.providerName).toBe('generic');
+    expect(config.proxy.backconnectPort).toBe(8080);
+  });
+
   describe('host binding', () => {
     test('defaults to 127.0.0.1 (loopback-only) when CAMOFOX_HOST unset', () => {
       delete process.env.CAMOFOX_HOST;
