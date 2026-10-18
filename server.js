@@ -2779,8 +2779,8 @@ app.post('/pressure/cleanup', async (req, res) => {
  *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs', async (req, res) => {
-  // Closes any tab this request registers once the client disconnects or the
-  // handler times out, so a late-finishing create never leaves an orphan tab.
+  // Closes any tab this request registers once the client disconnects, the
+  // handler times out, or the create fails, so no create leaves an orphan tab.
   const guard = createRequestGuard(res, { log, fields: { reqId: req.reqId, route: 'POST /tabs' } });
   try {
     const { userId, sessionKey, listItemId, url, trace } = req.body;
@@ -2910,6 +2910,8 @@ app.post('/tabs', async (req, res) => {
       log('warn', 'tab create abandoned by client', { reqId: req.reqId, error: err.message });
       return;
     }
+    // A failed create never returns its tabId, so close any tab it registered.
+    guard.abort('request_failed');
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
     // SSL certificate errors on initial navigation — non-retriable
     const isSslError = err.message && (
@@ -5582,7 +5584,7 @@ app.get('/tabs', async (req, res) => {
  *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/open', async (req, res) => {
-  // No handler timeout here, so only a client disconnect abandons the request.
+  // No handler timeout here: a client disconnect or a failed open closes the tab.
   const guard = createRequestGuard(res, { log, fields: { reqId: req.reqId, route: 'POST /tabs/open' } });
   try {
     const { url, userId, listItemId = 'default' } = req.body;
@@ -5668,6 +5670,7 @@ app.post('/tabs/open', async (req, res) => {
       log('warn', 'openclaw tab open abandoned by client', { reqId: req.reqId, error: err.message });
       return;
     }
+    guard.abort('request_failed');
     log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
