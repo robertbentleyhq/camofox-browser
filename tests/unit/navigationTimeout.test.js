@@ -203,3 +203,12 @@ describe('classifyError categorizes timeout vs proxy', () => {
     expect(classifyError(new Error('Target crashed'))).toBe('page_crashed');
   });
 });
+
+describe('classifyError session setup timeout', () => {
+  test('session_setup_timeout code wins over the generic timeout match', () => {
+    const err = Object.assign(new Error('session setup timed out after 60000ms during profile_restore'), {
+      code: 'session_setup_timeout',
+    });
+    expect(classifyError(err)).toBe('session_setup_timeout');
+  });
+});

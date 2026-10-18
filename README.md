@@ -629,6 +629,7 @@ Reddit macros return JSON directly (no HTML parsing needed):
 | `MAX_TABS_PER_SESSION` | Max tabs per session | `10` |
 | `SESSION_TIMEOUT_MS` | Session inactivity timeout | `1800000` (30min) |
 | `BROWSER_IDLE_TIMEOUT_MS` | Kill browser when idle (0 = never) | `300000` (5min) |
+| `SESSION_SETUP_TIMEOUT_MS` | Deadline for session setup (browser launch, proxy assign, profile load and restore, session hooks). On timeout, tab creation returns 503 `session_setup_timeout` with the stalled `step`, and each step's timing is logged. Non-positive values use the default. | `60000` (60s) |
 | `HANDLER_TIMEOUT_MS` | Max time for any handler | `30000` (30s) |
 | `MAX_CONCURRENT_PER_USER` | Concurrent request cap per user | `3` |
 | `MAX_OLD_SPACE_SIZE` | Node.js V8 heap limit (MB) | `128` |
