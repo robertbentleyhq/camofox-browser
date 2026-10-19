@@ -83,6 +83,64 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('a late teardown of an older context leaves the replacement tracked', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+
+    const mockContext = () => ({
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    });
+    const oldContext = mockContext();
+    const replacement = mockContext();
+
+    // A timed-out setup's context, then the retry's replacement, then the old
+    // setup's late teardown.
+    await events.emitAsync('session:created', { userId: 'user-4', context: oldContext });
+    await events.emitAsync('session:created', { userId: 'user-4', context: replacement });
+    await events.emitAsync('session:destroying', { userId: 'user-4', reason: 'session_setup_timeout', context: oldContext });
+    await events.emitAsync('session:destroyed', { userId: 'user-4', reason: 'session_setup_timeout', context: oldContext });
+    expect(replacement.storageState).not.toHaveBeenCalled();
+
+    // The replacement is still tracked, so a cookie import still checkpoints it.
+    await events.emitAsync('session:cookies:import', { userId: 'user-4' });
+    expect(replacement.storageState).toHaveBeenCalledTimes(1);
+  });
+
+  test('a replacement created during the old checkpoint stays tracked', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+
+    let releaseCheckpoint;
+    const checkpointGate = new Promise((r) => { releaseCheckpoint = r; });
+    const oldContext = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await checkpointGate;
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+    const replacement = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'user-5', context: oldContext });
+    const destroying = events.emitAsync('session:destroying', { userId: 'user-5', reason: 'session_setup_timeout', context: oldContext });
+    // The checkpoint does file I/O before it reaches storageState.
+    for (let i = 0; i < 100 && !oldContext.storageState.mock.calls.length; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(oldContext.storageState).toHaveBeenCalled();
+    // The retry stores its replacement while the old checkpoint is still writing.
+    await events.emitAsync('session:created', { userId: 'user-5', context: replacement });
+    releaseCheckpoint();
+    await destroying;
+    await events.emitAsync('session:destroyed', { userId: 'user-5', reason: 'session_setup_timeout', context: oldContext });
+
+    await events.emitAsync('session:cookies:import', { userId: 'user-5' });
+    expect(replacement.storageState).toHaveBeenCalledTimes(1);
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;

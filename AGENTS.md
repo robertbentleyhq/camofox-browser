@@ -340,7 +340,7 @@ export function register(app, ctx) {
 |-------|---------|-----------|
 | `session:creating` | `{ userId, contextOptions }` | (ok) Modify context options in-place |
 | `session:created` | `{ userId, context }` | |
-| `session:destroyed` | `{ userId, reason }` | |
+| `session:destroyed` | `{ userId, reason, context }` | |
 | `session:expired` | `{ userId, idleMs }` | |
 
 #### Tab Lifecycle

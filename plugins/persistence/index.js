@@ -100,18 +100,22 @@ export async function register(app, ctx, pluginConfig = {}) {
     }
   });
 
+  // A destroy event for an older context (a timed-out setup torn down late) must
+  // not checkpoint or untrack the replacement session now tracked for this user.
+  const isTracked = (userId, context) => !context || activeSessions.get(userId) === context;
+
   // On session destroying (pre-close): checkpoint while context is still alive
-  events.on('session:destroying', async ({ userId, reason }) => {
+  events.on('session:destroying', async ({ userId, reason, context: destroyed }) => {
     const context = activeSessions.get(userId);
-    if (context) {
+    if (context && isTracked(userId, destroyed)) {
       await checkpoint(userId, context, reason).catch(() => {});
-      activeSessions.delete(userId);
+      if (activeSessions.get(userId) === context) activeSessions.delete(userId);
     }
   });
 
   // On session destroyed (post-close): cleanup tracking if not already done
-  events.on('session:destroyed', async ({ userId }) => {
-    activeSessions.delete(userId);
+  events.on('session:destroyed', async ({ userId, context }) => {
+    if (isTracked(userId, context)) activeSessions.delete(userId);
   });
 
   // On shutdown: checkpoint all remaining sessions

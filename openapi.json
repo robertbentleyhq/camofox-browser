@@ -491,6 +491,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Session setup timed out (`code` session_setup_timeout, retryable). `step` names the setup step that stalled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       },
@@ -2524,6 +2534,16 @@
           },
           "400": {
             "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session setup timed out (`code` session_setup_timeout, retryable). `step` names the setup step that stalled.",
             "content": {
               "application/json": {
                 "schema": {

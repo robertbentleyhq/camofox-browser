@@ -33,6 +33,8 @@ import {
 import { actionFromReq, classifyError } from './lib/request-utils.js';
 import { cleanupOrphanedTempFiles, cleanupStaleFirefoxProfiles } from './lib/tmp-cleanup.js';
 import { coalesceInflight } from './lib/inflight.js';
+import { createSetupTracker, tabCreateBudgetMs } from './lib/session-setup.js';
+import { createRequestGuard } from './lib/request-guard.js';
 import { createReporter, createTabHealthTracker, collectResourceSnapshot, classifyProxyError, browserProcessTreeRssMb, browserProcessNameRssMb } from './lib/reporter.js';
 import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
@@ -684,6 +686,9 @@ if (proxyPool) {
 const BROWSER_IDLE_TIMEOUT_MS = CONFIG.browserIdleTimeoutMs;
 let browserIdleTimer = null;
 let browserLaunchPromise = null;
+// Launch sub-step in progress, so a session setup timeout during
+// browser_launch can name the part that stalled.
+let browserLaunchStep = null;
 let browserWarmRetryTimer = null;
 
 // Tracks why the browser was last stopped. Intentional reasons (idle_shutdown, admin_stop)
@@ -1074,6 +1079,10 @@ async function launchBrowserInstance() {
           excludeAddons: ['UBO'],
         });
       }
+      // With a proxy, launchOptions runs camoufox-js's geoip public-IP lookup through it.
+      const optionsStep = launchProxy ? 'proxy_ip_lookup' : 'launch_options';
+      browserLaunchStep = optionsStep;
+      let stepStart = Date.now();
       const options = await launchOptions({
         executable_path: externalCamoufox?.executablePath,
         headless: useVirtualDisplay ? false : true,
@@ -1085,6 +1094,7 @@ async function launchBrowserInstance() {
         virtual_display: vdDisplay,
         exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
       });
+      log('info', 'browser launch step', { step: optionsStep, ms: Date.now() - stepStart, attempt });
       options.proxy = normalizePlaywrightProxy(options.proxy);
       // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,
       // registering its own process signal handlers that send Browser.close
@@ -1097,9 +1107,13 @@ async function launchBrowserInstance() {
       options.handleSIGHUP = false;
       await pluginEvents.emitAsync('browser:launching', { options });
 
+      browserLaunchStep = 'browser_start';
+      stepStart = Date.now();
       candidateBrowser = await firefox.launch(options);
+      log('info', 'browser launch step', { step: 'browser_start', ms: Date.now() - stepStart, attempt });
 
       if (shouldProbeGoogleAtLaunch(proxyPool)) {
+        browserLaunchStep = 'google_probe';
         const probe = await probeGoogleSearch(candidateBrowser);
         if (!probe.ok) {
           log('warn', 'browser launch google probe failed', {
@@ -1150,6 +1164,8 @@ async function launchBrowserInstance() {
       });
       await candidateBrowser?.close().catch(() => {});
       if (localVirtualDisplay) localVirtualDisplay.kill();
+    } finally {
+      browserLaunchStep = null;
     }
   }
 
@@ -1200,13 +1216,24 @@ function clearSessionLocks(session) {
   refreshTabLockQueueDepth();
 }
 
-async function closeSession(userId, session, {
+// Exactly once per session, and every caller waits for that one close: a late
+// setup-timeout teardown can reach a session DELETE /sessions or idle cleanup
+// already closed, and a concurrent rotation must not reuse a closing context.
+// A failed close is not cached, so a later close (e.g. browser recovery) retries.
+function closeSession(userId, session, options) {
+  if (!session) return Promise.resolve();
+  session._closePromise ??= closeSessionNow(userId, session, options).catch((err) => {
+    delete session._closePromise;
+    throw err;
+  });
+  return session._closePromise;
+}
+
+async function closeSessionNow(userId, session, {
   reason = 'session_closed',
   clearDownloads = true,
   clearLocks = true,
 } = {}) {
-  if (!session) return;
-
   const key = normalizeUserId(userId);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
@@ -1219,7 +1246,7 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroying', { userId: key, reason, context: session.context });
   if (session.tracePath) {
     try {
       await session.context.tracing.stop({ path: session.tracePath });
@@ -1230,8 +1257,10 @@ async function closeSession(userId, session, {
   }
 
   await session.context.close().catch(() => {});
-  sessions.delete(key);
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  // Only remove this session's own entry: a replacement stored during the awaits
+  // above belongs to another setup and must stay.
+  if (sessions.get(key) === session) sessions.delete(key);
+  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason, context: session.context });
 
   refreshActiveTabsGauge();
 }
@@ -1246,7 +1275,15 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
 async function getSession(userId, { trace = false } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
-  
+
+  // A session whose session:created hooks are still running is not ready. Wait for
+  // its setup to finish (bounded by the setup deadline, which retracts the session)
+  // and re-read, so no caller builds tabs on a session a timeout will tear down.
+  while (session?.setupPending) {
+    await session.setupPending;
+    session = sessions.get(key);
+  }
+
   // Check if existing session's context is still alive
   if (session) {
     if (session._closing) {
@@ -1265,7 +1302,11 @@ async function getSession(userId, { trace = false } = {}) {
   }
   
   if (!session) {
-    session = await coalesceInflight(sessionCreations, key, async () => {
+    // One deadline covers the whole setup. On timeout the inflight entry clears so a
+    // retry starts fresh (reusing a browser launch that is still in progress), and
+    // work that finishes late is cleaned up instead of published.
+    const setup = createSetupTracker({ timeoutMs: CONFIG.sessionSetupTimeoutMs, log, fields: { userId: key } });
+    session = await coalesceInflight(sessionCreations, key, () => setup.run(async () => {
       if (sessions.size >= MAX_SESSIONS) {
         throw Object.assign(
           new Error('Maximum concurrent sessions reached'),
@@ -1289,7 +1330,7 @@ async function getSession(userId, { trace = false } = {}) {
           );
         }
       }
-      const b = await ensureBrowser();
+      const b = await setup.step('browser_launch', () => ensureBrowser(), { subStep: () => browserLaunchStep });
       const contextOptions = {
         viewport: null,
         permissions: ['geolocation'],
@@ -1302,17 +1343,25 @@ async function getSession(userId, { trace = false } = {}) {
         contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
       }
       let sessionProxy = null;
-      if (proxyPool?.canRotateSessions) {
-        sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
-        contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
-        log('info', 'session proxy assigned', { userId: key, sessionId: sessionProxy.sessionId });
-      } else if (proxyPool) {
-        sessionProxy = proxyPool.getNext();
-        contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
-        log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
+      if (proxyPool) {
+        await setup.step('proxy_assign', () => {
+          if (proxyPool.canRotateSessions) {
+            sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
+            contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
+            log('info', 'session proxy assigned', { userId: key, sessionId: sessionProxy.sessionId });
+          } else {
+            sessionProxy = proxyPool.getNext();
+            contextOptions.proxy = normalizePlaywrightProxy(sessionProxy);
+            log('info', 'session proxy assigned', { userId: key, proxy: sessionProxy.server });
+          }
+        });
       }
-      await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
-      const context = await newContextWithStorageFallback(b, contextOptions, key);
+      await setup.step('profile_load', () => pluginEvents.emitAsync('session:creating', { userId: key, contextOptions }));
+      const context = await setup.step(
+        contextOptions.storageState ? 'profile_restore' : 'context_create',
+        () => newContextWithStorageFallback(b, contextOptions, key),
+        { onLate: (lateContext) => lateContext.close().catch(() => {}) },
+      );
 
       let tracePath = null;
       if (trace) {
@@ -1327,17 +1376,50 @@ async function getSession(userId, { trace = false } = {}) {
         }
       }
 
-      const created = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
+      if (setup.abandoned) {
+        await context.close().catch(() => {});
+        return null;
+      }
+      let settleSetup;
+      const created = {
+        context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath,
+        setupPending: new Promise((resolve) => { settleSetup = resolve; }),
+      };
+      const finishSetup = () => {
+        delete created.setupPending;
+        settleSetup();
+      };
+      // session:created hooks run after the context is stored (plugin contract), so the
+      // deadline takes the stored session back out and closes its context at once,
+      // without waiting for a stalled hook. A retry then starts a fresh setup.
       sessions.set(key, created);
-      await pluginEvents.emitAsync('session:created', { userId: key, context });
+      setup.onAbandon(() => {
+        if (sessions.get(key) === created) sessions.delete(key);
+        context.close().catch(() => {});
+        finishSetup();
+      });
+      try {
+        await setup.step('session_hooks', () => pluginEvents.emitAsync('session:created', { userId: key, context }));
+      } catch (err) {
+        // Once the stalled hook settles, finish the teardown (plugin destroy events)
+        // unless a retry already stored a replacement: the user-keyed plugin state
+        // belongs to that session now.
+        if (setup.abandoned && !sessions.has(key)) {
+          await closeSession(key, created, { reason: 'session_setup_timeout', clearDownloads: true, clearLocks: true });
+        }
+        throw err;
+      } finally {
+        finishSetup();
+      }
       log('info', 'session created', {
         userId: key,
         proxyMode: proxyPool?.mode || null,
         proxyServer: sessionProxy?.server || browserLaunchProxy?.server || null,
         proxySession: sessionProxy?.sessionId || browserLaunchProxy?.sessionId || null,
+        timings: setup.timings,
       });
       return created;
-    });
+    }));
   }
   session.lastAccess = Date.now();
   return session;
@@ -1393,6 +1475,18 @@ function handleRouteError(err, req, res, extraFields = {}) {
   };
   if (tabId) {
     pluginEvents.emit('tab:error', { userId, tabId, error: err, ...sentryContext });
+  }
+  // Session setup hit its deadline. Answer before the timeout branches below,
+  // which would destroy the user's session over a setup that never published one.
+  if (err?.code === 'session_setup_timeout') {
+    return res.status(503).json({
+      error: `Session setup timed out during ${err.step}. Retry shortly.`,
+      code: 'session_setup_timeout',
+      step: err.step,
+      retryable: true,
+      recovery: 'retry',
+      ...extraFields,
+    });
   }
   if (isPageCrashedError(err)) {
     if (foundForContext) destroyTab(sessions.get(normalizeUserId(userId)), tabId, 'page_crashed', userId);
@@ -1494,6 +1588,15 @@ function handleRouteError(err, req, res, extraFields = {}) {
     }
   }
   sendError(res, err, extraFields);
+}
+
+// Close a tab whose creating request already gave up. Looks the tab up by id in the
+// user's current session, so a tab re-registered by the proxy-retry path is found too.
+function closeAbandonedTab(userId, tabId, reason, reqId) {
+  const session = sessions.get(normalizeUserId(userId));
+  if (session && destroyTab(session, tabId, 'request_abandoned', userId)) {
+    log('warn', 'tab closed for abandoned request', { reqId, tabId, reason });
+  }
 }
 
 function destroyTab(session, tabId, reason, userId) {
@@ -1812,8 +1915,8 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
     await closeSession(key, oldSession, { reason: 'google_rotate_context', clearDownloads: true, clearLocks: true });
   }
   const session = await getSession(userId);
-  const group = getTabGroup(session, sessionKey);
   const page = await session.context.newPage();
+  const group = getTabGroup(session, sessionKey);
   const tabState = createTabState(page);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
@@ -2708,8 +2811,17 @@ app.post('/pressure/cleanup', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Session setup timed out (`code` session_setup_timeout, retryable). `step` names the setup step that stalled.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs', async (req, res) => {
+  // Closes any tab this request registers once the client disconnects, the
+  // handler times out, or the create fails, so no create leaves an orphan tab.
+  const guard = createRequestGuard(res, { log, fields: { reqId: req.reqId, route: 'POST /tabs' } });
   try {
     const { userId, sessionKey, listItemId, url, trace } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
@@ -2734,7 +2846,7 @@ app.post('/tabs', async (req, res) => {
       }
     }
 
-    const result = await withTimeout((async () => {
+    const work = (async () => {
       const existing = sessions.get(normalizeUserId(userId));
       if (trace && existing && !existing.tracePath) {
         throw Object.assign(
@@ -2743,6 +2855,7 @@ app.post('/tabs', async (req, res) => {
         );
       }
       let session = await getSession(userId, { trace: !!trace });
+      guard.throwIfAborted();
       
       let totalTabs = 0;
       for (const group of session.tabGroups.values()) totalTabs += group.size;
@@ -2755,15 +2868,19 @@ app.post('/tabs', async (req, res) => {
         }
       }
       
-      const group = getTabGroup(session, resolvedSessionKey);
-      
       const page = await session.context.newPage();
+      // Look the group up after the await: a concurrent abandoned create can delete
+      // an emptied group while newPage is pending, and a stale Map would hide this tab.
+      const group = getTabGroup(session, resolvedSessionKey);
       const tabId = fly.makeTabId();
       let tabState = createTabState(page);
       attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
       group.set(tabId, tabState);
       attachPopupHandler(page, userId, resolvedSessionKey);
       refreshActiveTabsGauge();
+      // Register cleanup before checking, so a page that arrived after abandonment is closed.
+      guard.onAbort((reason) => closeAbandonedTab(userId, tabId, reason, req.reqId));
+      guard.throwIfAborted();
       
       if (url) {
         const urlErr = validateUrl(url);
@@ -2772,6 +2889,7 @@ app.post('/tabs', async (req, res) => {
         try {
           await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
         } catch (navErr) {
+          guard.throwIfAborted();
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
             log('warn', 'tab create navigate failed, retrying with fresh proxy', {
               reqId: req.reqId, tabId, error: navErr.message,
@@ -2783,14 +2901,17 @@ app.post('/tabs', async (req, res) => {
               await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
             }
             session = await getSession(userId, { trace: !!trace });
-            const retryGroup = getTabGroup(session, resolvedSessionKey);
+            guard.throwIfAborted();
             const retryPage = await session.context.newPage();
+            const retryGroup = getTabGroup(session, resolvedSessionKey);
             tabState = createTabState(retryPage);
             tabState.lastRequestedUrl = url;
             attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
             retryGroup.set(tabId, tabState);
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
+            guard.onAbort((reason) => closeAbandonedTab(userId, tabId, reason, req.reqId));
+            guard.throwIfAborted();
             await withPageLoadDuration('open_url', () => retryPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
           } else {
             throw navErr;
@@ -2798,14 +2919,40 @@ app.post('/tabs', async (req, res) => {
         }
         tabState.visitedUrls.add(url);
       }
+      guard.throwIfAborted();
       
       pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
       log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
       return { tabId, url: page.url() };
-    })(), requestTimeoutMs(), 'tab create');
+    })();
+    let workSettled = false;
+    work.then(() => { workSettled = true; }, () => { workSettled = true; });
+    // Leave room for a full session setup bound plus the normal create budget, so a
+    // stalled setup answers with its own 503 instead of a generic handler timeout.
+    const budgetMs = tabCreateBudgetMs({
+      requestTimeoutMs: requestTimeoutMs(),
+      setupTimeoutMs: CONFIG.sessionSetupTimeoutMs,
+      handlerTimeoutMs: HANDLER_TIMEOUT_MS,
+    });
+    let result;
+    try {
+      result = await withTimeout(work, budgetMs, 'tab create');
+    } catch (err) {
+      if (!workSettled) guard.abort('request_timeout');
+      throw err;
+    }
 
     res.json(result);
   } catch (err) {
+    if (guard.reason === 'client_disconnected') {
+      // Nobody is waiting for this answer. Closing the abandoned tab makes its
+      // in-flight work fail with closed-target errors, which handleRouteError
+      // would read as a dead context and use to destroy the whole session.
+      log('warn', 'tab create abandoned by client', { reqId: req.reqId, error: err.message });
+      return;
+    }
+    // A failed create never returns its tabId, so close any tab it registered.
+    guard.abort('request_failed');
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
     // SSL certificate errors on initial navigation — non-retriable
     const isSslError = err.message && (
@@ -2821,7 +2968,7 @@ app.post('/tabs', async (req, res) => {
       });
     }
     // Memory pressure / max sessions → bounce through LB to another machine
-    if (FLY_MACHINE_ID && err.statusCode === 503) {
+    if (FLY_MACHINE_ID && err.statusCode === 503 && err.code !== 'session_setup_timeout') {
       res.set('fly-replay', `app=${CONFIG.flyAppName || 'camofox-browser'}`);
       return res.status(503).json({ error: safeError(err), code: err.code || 'admission_rejected' });
     }
@@ -2959,8 +3106,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             await closeSession(key, oldSession, { reason: 'google_blocked_context_rotate', clearDownloads: true, clearLocks: true });
           }
           session = await getSession(userId);
-          const group = getTabGroup(session, currentSessionKey);
           const page = await session.context.newPage();
+          const group = getTabGroup(session, currentSessionKey);
           tabState = createTabState(page);
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -5470,8 +5617,16 @@ app.get('/tabs', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Session setup timed out (`code` session_setup_timeout, retryable). `step` names the setup step that stalled.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/open', async (req, res) => {
+  // No handler timeout here: a client disconnect or a failed open closes the tab.
+  const guard = createRequestGuard(res, { log, fields: { reqId: req.reqId, route: 'POST /tabs/open' } });
   try {
     const { url, userId, listItemId = 'default' } = req.body;
     if (!userId) {
@@ -5485,6 +5640,7 @@ app.post('/tabs/open', async (req, res) => {
     if (urlErr) return res.status(400).json({ error: urlErr });
     
     let session = await getSession(userId);
+    guard.throwIfAborted();
     
     // Recycle oldest tab when limits are reached instead of rejecting
     let totalTabs = 0;
@@ -5496,19 +5652,22 @@ app.post('/tabs/open', async (req, res) => {
       }
     }
     
-    let group = getTabGroup(session, listItemId);
-    
     let page = await session.context.newPage();
+    // After the await, as in POST /tabs: a group emptied meanwhile may have been deleted.
+    let group = getTabGroup(session, listItemId);
     const tabId = fly.makeTabId();
     let tabState = createTabState(page);
     attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
     group.set(tabId, tabState);
     attachPopupHandler(page, userId, listItemId);
     refreshActiveTabsGauge();
+    guard.onAbort((reason) => closeAbandonedTab(userId, tabId, reason, req.reqId));
+    guard.throwIfAborted();
     
     try {
       await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
     } catch (navErr) {
+      guard.throwIfAborted();
       if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
         log('warn', 'tab open failed, retrying with fresh proxy', {
           reqId: req.reqId, tabId, error: navErr.message,
@@ -5520,19 +5679,23 @@ app.post('/tabs/open', async (req, res) => {
           await closeSession(key, oldSession, { reason: 'proxy_retry_rotate', clearDownloads: true, clearLocks: true });
         }
         session = await getSession(userId);
-        group = getTabGroup(session, listItemId);
+        guard.throwIfAborted();
         page = await session.context.newPage();
+        group = getTabGroup(session, listItemId);
         tabState = createTabState(page);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
         group.set(tabId, tabState);
         attachPopupHandler(page, userId, listItemId);
         refreshActiveTabsGauge();
+        guard.onAbort((reason) => closeAbandonedTab(userId, tabId, reason, req.reqId));
+        guard.throwIfAborted();
         await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
       } else {
         throw navErr;
       }
     }
     tabState.visitedUrls.add(url);
+    guard.throwIfAborted();
     
     log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
     res.json({ 
@@ -5543,6 +5706,12 @@ app.post('/tabs/open', async (req, res) => {
       title: await page.title().catch(() => '')
     });
   } catch (err) {
+    if (guard.aborted) {
+      // See POST /tabs: the client is gone, and closing its tab must not be read as a dead context.
+      log('warn', 'openclaw tab open abandoned by client', { reqId: req.reqId, error: err.message });
+      return;
+    }
+    guard.abort('request_failed');
     log('error', 'openclaw tab open failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }

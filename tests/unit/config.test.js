@@ -101,3 +101,25 @@ describe('loadConfig', () => {
     });
   });
 });
+
+describe('session setup and idle timeouts', () => {
+  test('SESSION_SETUP_TIMEOUT_MS defaults to 60000', () => {
+    delete process.env.SESSION_SETUP_TIMEOUT_MS;
+    expect(loadConfig().sessionSetupTimeoutMs).toBe(60000);
+  });
+
+  test('uses a valid SESSION_SETUP_TIMEOUT_MS', () => {
+    process.env.SESSION_SETUP_TIMEOUT_MS = '45000';
+    expect(loadConfig().sessionSetupTimeoutMs).toBe(45000);
+  });
+
+  test.each(['0', '-5', 'abc', ''])('falls back to 60000 for SESSION_SETUP_TIMEOUT_MS=%p', (value) => {
+    process.env.SESSION_SETUP_TIMEOUT_MS = value;
+    expect(loadConfig().sessionSetupTimeoutMs).toBe(60000);
+  });
+
+  test('BROWSER_IDLE_TIMEOUT_MS still defaults to 5 minutes', () => {
+    delete process.env.BROWSER_IDLE_TIMEOUT_MS;
+    expect(loadConfig().browserIdleTimeoutMs).toBe(300000);
+  });
+});
