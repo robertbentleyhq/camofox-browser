@@ -1216,17 +1216,20 @@ function clearSessionLocks(session) {
   refreshTabLockQueueDepth();
 }
 
-async function closeSession(userId, session, {
+// Exactly once per session, and every caller waits for that one close: a late
+// setup-timeout teardown can reach a session DELETE /sessions or idle cleanup
+// already closed, and a concurrent rotation must not reuse a closing context.
+function closeSession(userId, session, options) {
+  if (!session) return Promise.resolve();
+  session._closePromise ??= closeSessionNow(userId, session, options);
+  return session._closePromise;
+}
+
+async function closeSessionNow(userId, session, {
   reason = 'session_closed',
   clearDownloads = true,
   clearLocks = true,
 } = {}) {
-  if (!session) return;
-  // Exactly once per session: a late setup-timeout teardown can reach a session
-  // that DELETE /sessions or idle cleanup already closed.
-  if (session._destroyed) return;
-  session._destroyed = true;
-
   const key = normalizeUserId(userId);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"

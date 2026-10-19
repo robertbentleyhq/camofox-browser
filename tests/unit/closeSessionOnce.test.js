@@ -21,7 +21,10 @@ function extractFunction(src, signature) {
 }
 
 function loadCloseSession(deps) {
-  const body = extractFunction(serverSrc, 'async function closeSession(');
+  const body = [
+    extractFunction(serverSrc, 'function closeSession('),
+    extractFunction(serverSrc, 'async function closeSessionNow('),
+  ].join('\n');
   const names = Object.keys(deps);
   return new Function(...names, `${body}\nreturn closeSession;`)(...names.map((n) => deps[n]));
 }
@@ -41,9 +44,13 @@ describe('closeSession', () => {
       refreshActiveTabsGauge: () => {},
       log: () => {},
     });
-    const session = { context: { close: async () => {} }, tabGroups: new Map() };
+    let closed = false;
+    const session = {
+      context: { close: async () => { await new Promise((r) => setTimeout(r, 20)); closed = true; } },
+      tabGroups: new Map(),
+    };
     sessions.set('u1', session);
-    return { closeSession, destroyed, sessions, session };
+    return { closeSession, destroyed, sessions, session, isClosed: () => closed };
   }
 
   test('a second close of the same session emits no second session:destroyed', async () => {
@@ -53,14 +60,16 @@ describe('closeSession', () => {
     expect(destroyed).toEqual([{ userId: 'u1', reason: 'user_delete' }]);
   });
 
-  test('concurrent closes of the same session emit session:destroyed once', async () => {
-    const { closeSession, destroyed, sessions, session } = setup();
-    await Promise.all([
-      closeSession('u1', session, { reason: 'user_delete' }),
-      closeSession('u1', session, { reason: 'session_setup_timeout' }),
-    ]);
-    expect(destroyed).toHaveLength(1);
+  test('concurrent closes emit session:destroyed once and both wait for the close', async () => {
+    const { closeSession, destroyed, sessions, session, isClosed } = setup();
+    const first = closeSession('u1', session, { reason: 'user_delete' });
+    // A second caller (e.g. a Google rotation) must not get back control, and then
+    // reuse the session, while the first close is still running.
+    await closeSession('u1', session, { reason: 'google_rotate_context' });
+    expect(isClosed()).toBe(true);
     expect(sessions.has('u1')).toBe(false);
+    await first;
+    expect(destroyed).toHaveLength(1);
   });
 
   test('closing an old session keeps a replacement stored under the same user', async () => {
