@@ -104,6 +104,38 @@ describe('createSetupTracker', () => {
     ]);
   });
 
+  test('onAbandon listeners run at the deadline while the stalled step is still pending', async () => {
+    const log = jest.fn();
+    const tracker = createSetupTracker({ timeoutMs: 100, log, fields: { userId: 'user-1' } });
+    const hook = deferred();
+    const order = [];
+    tracker.onAbandon(() => { throw new Error('listener boom'); });
+    tracker.onAbandon(() => order.push(['listener', tracker.abandoned, tracker.activeStep]));
+    let stepSettled = false;
+    const outcome = tracker.run(async (setup) => {
+      try {
+        await setup.step('session_hooks', () => hook.promise);
+      } finally {
+        stepSettled = true;
+      }
+    }).catch((err) => { order.push(['rejected']); return err; });
+
+    await jest.advanceTimersByTimeAsync(99);
+    expect(order).toEqual([]);
+    await jest.advanceTimersByTimeAsync(1);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(SessionSetupTimeoutError);
+    expect(error.step).toBe('session_hooks');
+    expect(order).toEqual([['listener', true, 'session_hooks'], ['rejected']]);
+    expect(stepSettled).toBe(false);
+    expect(log).toHaveBeenCalledWith('warn', 'session setup abandon listener failed', {
+      userId: 'user-1', error: 'listener boom',
+    });
+    hook.resolve();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(stepSettled).toBe(true);
+  });
+
   test('steps started after abandonment reject without invoking their work', async () => {
     const tracker = createSetupTracker({ timeoutMs: 100, log: jest.fn() });
     const outcome = tracker.run(() => new Promise(() => {})).catch((err) => err);

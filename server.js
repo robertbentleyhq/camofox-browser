@@ -1246,7 +1246,9 @@ async function closeSession(userId, session, {
   }
 
   await session.context.close().catch(() => {});
-  sessions.delete(key);
+  // Only remove this session's own entry: a replacement stored during the awaits
+  // above belongs to another setup and must stay.
+  if (sessions.get(key) === session) sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
 
   refreshActiveTabsGauge();
@@ -1262,7 +1264,15 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
 async function getSession(userId, { trace = false } = {}) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
-  
+
+  // A session whose session:created hooks are still running is not ready. Wait for
+  // its setup to finish (bounded by the setup deadline, which retracts the session)
+  // and re-read, so no caller builds tabs on a session a timeout will tear down.
+  while (session?.setupPending) {
+    await session.setupPending;
+    session = sessions.get(key);
+  }
+
   // Check if existing session's context is still alive
   if (session) {
     if (session._closing) {
@@ -1359,17 +1369,36 @@ async function getSession(userId, { trace = false } = {}) {
         await context.close().catch(() => {});
         return null;
       }
-      const created = { context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath };
-      // session:created hooks run after the context is stored (plugin contract), so a
-      // timeout during them must take the stored session back out.
+      let settleSetup;
+      const created = {
+        context, tabGroups: new Map(), lastAccess: Date.now(), proxySessionId: sessionProxy?.sessionId || null, tracePath,
+        setupPending: new Promise((resolve) => { settleSetup = resolve; }),
+      };
+      const finishSetup = () => {
+        delete created.setupPending;
+        settleSetup();
+      };
+      // session:created hooks run after the context is stored (plugin contract), so the
+      // deadline takes the stored session back out and closes its context at once,
+      // without waiting for a stalled hook. A retry then starts a fresh setup.
       sessions.set(key, created);
+      setup.onAbandon(() => {
+        if (sessions.get(key) === created) sessions.delete(key);
+        context.close().catch(() => {});
+        finishSetup();
+      });
       try {
         await setup.step('session_hooks', () => pluginEvents.emitAsync('session:created', { userId: key, context }));
       } catch (err) {
-        if (setup.abandoned && sessions.get(key) === created) {
+        // Once the stalled hook settles, finish the teardown (plugin destroy events)
+        // unless a retry already stored a replacement: the user-keyed plugin state
+        // belongs to that session now.
+        if (setup.abandoned && !sessions.has(key)) {
           await closeSession(key, created, { reason: 'session_setup_timeout', clearDownloads: true, clearLocks: true });
         }
         throw err;
+      } finally {
+        finishSetup();
       }
       log('info', 'session created', {
         userId: key,
@@ -1875,8 +1904,8 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
     await closeSession(key, oldSession, { reason: 'google_rotate_context', clearDownloads: true, clearLocks: true });
   }
   const session = await getSession(userId);
-  const group = getTabGroup(session, sessionKey);
   const page = await session.context.newPage();
+  const group = getTabGroup(session, sessionKey);
   const tabState = createTabState(page);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
@@ -2828,9 +2857,10 @@ app.post('/tabs', async (req, res) => {
         }
       }
       
-      const group = getTabGroup(session, resolvedSessionKey);
-      
       const page = await session.context.newPage();
+      // Look the group up after the await: a concurrent abandoned create can delete
+      // an emptied group while newPage is pending, and a stale Map would hide this tab.
+      const group = getTabGroup(session, resolvedSessionKey);
       const tabId = fly.makeTabId();
       let tabState = createTabState(page);
       attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -2861,8 +2891,8 @@ app.post('/tabs', async (req, res) => {
             }
             session = await getSession(userId, { trace: !!trace });
             guard.throwIfAborted();
-            const retryGroup = getTabGroup(session, resolvedSessionKey);
             const retryPage = await session.context.newPage();
+            const retryGroup = getTabGroup(session, resolvedSessionKey);
             tabState = createTabState(retryPage);
             tabState.lastRequestedUrl = url;
             attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -3065,8 +3095,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             await closeSession(key, oldSession, { reason: 'google_blocked_context_rotate', clearDownloads: true, clearLocks: true });
           }
           session = await getSession(userId);
-          const group = getTabGroup(session, currentSessionKey);
           const page = await session.context.newPage();
+          const group = getTabGroup(session, currentSessionKey);
           tabState = createTabState(page);
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -5611,9 +5641,9 @@ app.post('/tabs/open', async (req, res) => {
       }
     }
     
-    let group = getTabGroup(session, listItemId);
-    
     let page = await session.context.newPage();
+    // After the await, as in POST /tabs: a group emptied meanwhile may have been deleted.
+    let group = getTabGroup(session, listItemId);
     const tabId = fly.makeTabId();
     let tabState = createTabState(page);
     attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
@@ -5639,8 +5669,8 @@ app.post('/tabs/open', async (req, res) => {
         }
         session = await getSession(userId);
         guard.throwIfAborted();
-        group = getTabGroup(session, listItemId);
         page = await session.context.newPage();
+        group = getTabGroup(session, listItemId);
         tabState = createTabState(page);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
         group.set(tabId, tabState);
