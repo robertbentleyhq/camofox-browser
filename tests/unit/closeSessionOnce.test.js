@@ -50,7 +50,7 @@ describe('closeSession', () => {
       tabGroups: new Map(),
     };
     sessions.set('u1', session);
-    return { closeSession, destroyed, sessions, session, isClosed: () => closed };
+    return { closeSession, destroyed, sessions, session, pluginEvents, isClosed: () => closed };
   }
 
   test('a second close of the same session emits no second session:destroyed', async () => {
@@ -70,6 +70,19 @@ describe('closeSession', () => {
     expect(sessions.has('u1')).toBe(false);
     await first;
     expect(destroyed).toHaveLength(1);
+  });
+
+  test('a failed close is not cached, so a later close retries', async () => {
+    const { closeSession, destroyed, sessions, session, pluginEvents } = setup();
+    let fail = true;
+    pluginEvents.on('session:destroying', () => {
+      if (fail) throw new Error('checkpoint hook failed');
+    });
+    await expect(closeSession('u1', session, { reason: 'user_delete' })).rejects.toThrow('checkpoint hook failed');
+    fail = false;
+    await closeSession('u1', session, { reason: 'browser_restart' });
+    expect(destroyed).toEqual([{ userId: 'u1', reason: 'browser_restart' }]);
+    expect(sessions.has('u1')).toBe(false);
   });
 
   test('closing an old session keeps a replacement stored under the same user', async () => {

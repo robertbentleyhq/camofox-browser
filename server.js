@@ -1219,9 +1219,13 @@ function clearSessionLocks(session) {
 // Exactly once per session, and every caller waits for that one close: a late
 // setup-timeout teardown can reach a session DELETE /sessions or idle cleanup
 // already closed, and a concurrent rotation must not reuse a closing context.
+// A failed close is not cached, so a later close (e.g. browser recovery) retries.
 function closeSession(userId, session, options) {
   if (!session) return Promise.resolve();
-  session._closePromise ??= closeSessionNow(userId, session, options);
+  session._closePromise ??= closeSessionNow(userId, session, options).catch((err) => {
+    delete session._closePromise;
+    throw err;
+  });
   return session._closePromise;
 }
 
