@@ -1222,6 +1222,10 @@ async function closeSession(userId, session, {
   clearLocks = true,
 } = {}) {
   if (!session) return;
+  // Exactly once per session: a late setup-timeout teardown can reach a session
+  // that DELETE /sessions or idle cleanup already closed.
+  if (session._destroyed) return;
+  session._destroyed = true;
 
   const key = normalizeUserId(userId);
 
@@ -1235,7 +1239,7 @@ async function closeSession(userId, session, {
     await clearSessionDownloads(session).catch(() => {});
   }
 
-  await pluginEvents.emitAsync('session:destroying', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroying', { userId: key, reason, context: session.context });
   if (session.tracePath) {
     try {
       await session.context.tracing.stop({ path: session.tracePath });
@@ -1249,7 +1253,7 @@ async function closeSession(userId, session, {
   // Only remove this session's own entry: a replacement stored during the awaits
   // above belongs to another setup and must stay.
   if (sessions.get(key) === session) sessions.delete(key);
-  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
+  await pluginEvents.emitAsync('session:destroyed', { userId: key, reason, context: session.context });
 
   refreshActiveTabsGauge();
 }

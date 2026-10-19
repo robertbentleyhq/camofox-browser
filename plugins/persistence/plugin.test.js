@@ -83,6 +83,30 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('a late teardown of an older context leaves the replacement tracked', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir });
+
+    const mockContext = () => ({
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    });
+    const oldContext = mockContext();
+    const replacement = mockContext();
+
+    // A timed-out setup's context, then the retry's replacement, then the old
+    // setup's late teardown.
+    await events.emitAsync('session:created', { userId: 'user-4', context: oldContext });
+    await events.emitAsync('session:created', { userId: 'user-4', context: replacement });
+    await events.emitAsync('session:destroying', { userId: 'user-4', reason: 'session_setup_timeout', context: oldContext });
+    await events.emitAsync('session:destroyed', { userId: 'user-4', reason: 'session_setup_timeout', context: oldContext });
+    expect(replacement.storageState).not.toHaveBeenCalled();
+
+    // The replacement is still tracked, so a cookie import still checkpoints it.
+    await events.emitAsync('session:cookies:import', { userId: 'user-4' });
+    expect(replacement.storageState).toHaveBeenCalledTimes(1);
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;
